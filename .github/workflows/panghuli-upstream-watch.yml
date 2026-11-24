@@ -87,8 +87,11 @@ jobs:
             echo "- 上游最新：[\`${head:0:9}\`](https://github.com/${UPSTREAM_REPO}/commit/${head})"
             echo "- 完整对比：https://github.com/${UPSTREAM_REPO}/compare/${base}...${head}"
             echo "- 改动规模：$(git diff --shortstat "${base}..${up}")"
-            echo "- 涉及 S3 / 115 Open（我们打过补丁的目录）："
-            git diff --stat "${base}..${up}" -- server/s3 drivers/115_open internal/op | tail -1 | sed 's/^/  /'
+            touched=$(git diff --shortstat "${base}..${up}" -- server/s3 drivers/115_open internal/db go.mod)
+            echo "- 我们打过补丁的范围（server/s3、drivers/115_open、internal/db、go.mod）：${touched:- 无改动}"
+            if git diff "${base}..${up}" -- go.mod | grep -q '^[-+].*OpenListTeam/gofakes3 '; then
+              echo "- 上游改了 gofakes3 版本：把 panghuli-studio/gofakes3 rebase 到新版本、打 tag，再改 go.mod 里的 replace。"
+            fi
             echo
             echo "## 合并预检"
             echo
