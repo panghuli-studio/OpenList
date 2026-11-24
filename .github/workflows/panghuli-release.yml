@@ -29,6 +29,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: dev
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
@@ -39,9 +41,17 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     steps:
+      # Build the current tip of dev, not the commit that triggered the run: a run queued
+      # behind another one could otherwise tag a commit older than dev. That failed with
+      # "HTTP 403: Resource not accessible by integration" after a later commit on dev had
+      # changed a workflow file (most likely because GITHUB_TOKEN has no workflows
+      # permission). Commits that paths-ignore skips also get released with the next build.
       - uses: actions/checkout@v4
         with:
+          ref: dev
           fetch-depth: 0
+      - id: rev
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
       - id: prep
         run: bash .github/panghuli/prepare.sh
       - uses: docker/setup-qemu-action@v3
@@ -66,7 +76,7 @@ jobs:
           tags: ${{ env.IMAGE }}:${{ steps.prep.outputs.tag }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.revision=${{ steps.rev.outputs.sha }}
             org.opencontainers.image.version=${{ steps.prep.outputs.tag }}
             org.opencontainers.image.licenses=AGPL-3.0-only
           cache-from: type=gha,scope=panghuli
@@ -79,9 +89,10 @@ jobs:
           PREVIOUS: ${{ steps.prep.outputs.previous }}
           WEB_VERSION: ${{ steps.prep.outputs.web_version }}
           DIGEST: ${{ steps.build.outputs.digest }}
+          SHA: ${{ steps.rev.outputs.sha }}
         run: |
           {
-            echo "Built from \`dev\` at ${GITHUB_SHA}."
+            echo "Built from \`dev\` at ${SHA}."
             echo
             echo "Image: \`${IMAGE}:${TAG}\`"
             echo
@@ -91,13 +102,13 @@ jobs:
             echo
             if [ -n "$PREVIOUS" ]; then
               echo "Changes since ${PREVIOUS}:"
-              range="${PREVIOUS}..${GITHUB_SHA}"
+              range="${PREVIOUS}..${SHA}"
             else
               base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-panghuli.*' HEAD)
               echo "Changes on top of upstream ${base}:"
-              range="${base}..${GITHUB_SHA}"
+              range="${base}..${SHA}"
             fi
             echo
             git log --no-merges --format='- %s (%h)' "$range" | head -100
           } > notes.md
-          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
+          gh release create "$TAG" --target "$SHA" --title "$TAG" --notes-file notes.md
