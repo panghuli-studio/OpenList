@@ -94,3 +94,11 @@ func TestGetReturnsLookedUpFileWhenListingNeverCatchesUp(t *testing.T) {
 		t.Fatalf("parent listed %d times, want %d", n, len(parentListRetryDelays)+1)
 	}
 }
+
+// Overwriting a file through S3 or WebDAV must replace it, so op.Put has to move the old
+// file away first.
+func TestConfigReplacesExistingFileOnUpload(t *testing.T) {
+	if !(&Open115{}).Config().NoOverwriteUpload {
+		t.Fatal("115 Open must set NoOverwriteUpload")
+	}
+}
