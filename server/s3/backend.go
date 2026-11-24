@@ -116,21 +116,28 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	bucketPath := bucket.Path
 
 	fp := path.Join(bucketPath, objectName)
-	fmeta, _ := op.GetNearestMeta(fp)
-	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
-	if err != nil {
+	node, rec, err := b.statObject(ctx, fp)
+	if err != nil && rec == nil {
+		return nil, gofakes3.KeyNotFound(objectName)
+	}
+	if node != nil && node.IsDir() {
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
 
-	if node.IsDir() {
-		return nil, gofakes3.KeyNotFound(objectName)
+	var size int64
+	var etag string
+	var stored map[string]string
+	var modified time.Time
+	if rec != nil {
+		size, modified = rec.Size, rec.UpdatedAt
+		etag, stored = etagAndMeta(rec, &model.Object{Size: rec.Size})
+	} else {
+		size, modified = node.GetSize(), node.ModTime()
+		etag, stored = loadObjectMeta(fp, node)
 	}
-
-	size := node.GetSize()
-	etag, stored := loadObjectMeta(fp, node)
 
 	meta := map[string]string{
-		"Last-Modified": node.ModTime().UTC().Format(timeFormat),
+		"Last-Modified": modified.UTC().Format(timeFormat),
 		"Content-Type":  utils.GetMimeType(fp),
 	}
 	for k, v := range stored {
@@ -157,9 +164,13 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	bucketPath := bucket.Path
 
 	fp := path.Join(bucketPath, objectName)
-	fmeta, _ := op.GetNearestMeta(fp)
-	node, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
+	node, rec, err := b.statObject(ctx, fp)
 	if err != nil {
+		if rec != nil {
+			// Written moments ago but not readable from the storage yet: ask the client to
+			// retry instead of claiming the object does not exist.
+			return nil, gofakes3.ErrSlowDown
+		}
 		return nil, gofakes3.KeyNotFound(objectName)
 	}
 
@@ -181,6 +192,9 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	if size <= 0 {
 		size = file.GetSize()
 	}
+	if size <= 0 && rec != nil {
+		size = rec.Size
+	}
 	rnge, err := rangeRequest.Range(size)
 	if err != nil {
 		return nil, err
@@ -201,7 +215,13 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		return nil, err
 	}
 
-	etag, stored := loadObjectMeta(fp, node)
+	var etag string
+	var stored map[string]string
+	if rec != nil {
+		etag, stored = etagAndMeta(rec, &model.Object{Size: rec.Size})
+	} else {
+		etag, stored = loadObjectMeta(fp, node)
+	}
 	meta := map[string]string{
 		"Last-Modified":       node.ModTime().UTC().Format(timeFormat),
 		"Content-Disposition": utils.GenerateContentDisposition(file.GetName()),
