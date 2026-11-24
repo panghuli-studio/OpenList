@@ -1,15 +1,21 @@
 package s3
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"path"
 	"slices"
 	"strings"
+	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/OpenList/v4/internal/db"
+	"github.com/OpenListTeam/OpenList/v4/internal/fs"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
+	"github.com/OpenListTeam/OpenList/v4/internal/op"
 	"github.com/OpenListTeam/OpenList/v4/pkg/utils"
 	log "github.com/sirupsen/logrus"
 )
@@ -98,4 +104,48 @@ func fallbackETag(node model.Obj) string {
 	}
 	sum := md5.Sum([]byte(seed))
 	return `"` + hex.EncodeToString(sum[:]) + `-1"`
+}
+
+// recentWriteWindow bounds how long the S3 server trusts its own record of a write over a
+// storage that does not show the object yet (eventually consistent listings right after an
+// upload, or a directory cache that a concurrent List refilled without it).
+const recentWriteWindow = 5 * time.Minute
+
+func recentRecord(fp string) *model.S3ObjectMeta {
+	rec, err := db.GetS3ObjectMeta(fp)
+	if err != nil {
+		log.Errorf("s3: load metadata of %s: %+v", fp, err)
+		return nil
+	}
+	if rec == nil || time.Since(rec.UpdatedAt) > recentWriteWindow {
+		return nil
+	}
+	return rec
+}
+
+// statObject looks up the storage object at fp. When the storage misses an object, or
+// reports it empty, while the S3 server wrote it within recentWriteWindow, it refreshes the
+// parent listing once. If that still does not show the written object, it also returns the
+// record (rec != nil), which callers trust for size, ETag and metadata.
+func (b *s3Backend) statObject(ctx context.Context, fp string) (node model.Obj, rec *model.S3ObjectMeta, err error) {
+	fmeta, _ := op.GetNearestMeta(fp)
+	ctx = context.WithValue(ctx, conf.MetaKey, fmeta)
+	node, err = fs.Get(ctx, fp, &fs.GetArgs{})
+	if err == nil && (node.IsDir() || node.GetSize() > 0) {
+		return node, nil, nil
+	}
+	rec = recentRecord(fp)
+	if rec == nil || (err == nil && rec.Size == 0) {
+		return node, nil, err
+	}
+	if _, lerr := fs.List(ctx, path.Dir(fp), &fs.ListArgs{Refresh: true, NoLog: true}); lerr == nil {
+		if n, gerr := fs.Get(ctx, fp, &fs.GetArgs{}); gerr == nil {
+			if n.IsDir() || n.GetSize() == rec.Size {
+				return n, nil, nil
+			}
+			node, err = n, nil
+		}
+	}
+	log.Debugf("s3: storage does not show %s written at %s yet; answering from the S3 record", fp, rec.UpdatedAt)
+	return node, rec, err
 }

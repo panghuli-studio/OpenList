@@ -226,9 +226,36 @@ func (d *Open115) Get(ctx context.Context, path string) (model.Obj, error) {
 		UpPt: parseTime(resp.PTime),
 	}
 	if !obj.IsDir() && obj.ModTime().Unix() <= 0 {
-		return d.getFromParent(ctx, path, obj.GetID())
+		listed, err := d.getFromParentRetrying(ctx, path, obj.GetID())
+		if err == nil {
+			return listed, nil
+		}
+		if !errs.IsObjectNotFound(err) {
+			return nil, err
+		}
+		// The path lookup proved the file exists; incomplete metadata is better than
+		// reporting a file that was just uploaded as missing.
+		return obj, nil
 	}
 	return obj, nil
+}
+
+// parentListRetryDelays: right after an upload, 115 can answer the path lookup with
+// incomplete metadata while the parent listing does not show the file yet (#2788).
+var parentListRetryDelays = []time.Duration{500 * time.Millisecond, time.Second, 2 * time.Second}
+
+func (d *Open115) getFromParentRetrying(ctx context.Context, path, id string) (model.Obj, error) {
+	for attempt := 0; ; attempt++ {
+		obj, err := d.getFromParent(ctx, path, id)
+		if err == nil || !errs.IsObjectNotFound(err) || attempt >= len(parentListRetryDelays) {
+			return obj, err
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(parentListRetryDelays[attempt]):
+		}
+	}
 }
 
 func (d *Open115) getFromParent(ctx context.Context, path, id string) (model.Obj, error) {
