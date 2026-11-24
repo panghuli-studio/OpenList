@@ -4,8 +4,10 @@ package s3
 
 import (
 	"context"
+	"crypto/md5"
 	"encoding/hex"
 	"fmt"
+	"hash"
 	"io"
 	"path"
 	"strings"
@@ -38,7 +40,6 @@ var (
 // multipart uploads are streamed to local temp files part-by-part and
 // assembled into storage on completion, instead of being buffered in memory.
 type s3Backend struct {
-	meta    *sync.Map
 	listDir func(context.Context, string) ([]model.Obj, error)
 	uploads *sync.Map // map[gofakes3.UploadID]*multipartState
 }
@@ -46,7 +47,6 @@ type s3Backend struct {
 // newBackend creates a new SimpleBucketBackend.
 func newBackend() gofakes3.Backend {
 	b := &s3Backend{
-		meta:    new(sync.Map),
 		uploads: new(sync.Map),
 		listDir: getDirEntries,
 	}
@@ -127,23 +127,19 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	}
 
 	size := node.GetSize()
-	// hash := getFileHashByte(fobj)
+	etag, stored := loadObjectMeta(fp, node)
 
 	meta := map[string]string{
-		"Last-Modified": node.ModTime().Format(timeFormat),
+		"Last-Modified": node.ModTime().UTC().Format(timeFormat),
 		"Content-Type":  utils.GetMimeType(fp),
 	}
-
-	if val, ok := b.meta.Load(fp); ok {
-		metaMap := val.(map[string]string)
-		for k, v := range metaMap {
-			meta[k] = v
-		}
+	for k, v := range stored {
+		meta[k] = v
 	}
 
 	return &gofakes3.Object{
-		Name: objectName,
-		// Hash:     hash,
+		Name:     objectName,
+		ETag:     etag,
 		Metadata: meta,
 		Size:     size,
 		Contents: noOpReadCloser{},
@@ -205,24 +201,21 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 		return nil, err
 	}
 
+	etag, stored := loadObjectMeta(fp, node)
 	meta := map[string]string{
-		"Last-Modified":       node.ModTime().Format(timeFormat),
+		"Last-Modified":       node.ModTime().UTC().Format(timeFormat),
 		"Content-Disposition": utils.GenerateContentDisposition(file.GetName()),
 		"Content-Type":        utils.GetMimeType(fp),
 	}
-
-	if val, ok := b.meta.Load(fp); ok {
-		metaMap := val.(map[string]string)
-		for k, v := range metaMap {
-			meta[k] = v
-		}
+	for k, v := range stored {
+		meta[k] = v
 	}
 	closers := utils.NewClosers(rd, link)
 
 	return &gofakes3.Object{
 		// Name: gofakes3.URLEncode(objectName),
-		Name: objectName,
-		// Hash:     "",
+		Name:     objectName,
+		ETag:     etag,
 		Metadata: meta,
 		Size:     size,
 		Range:    rnge,
@@ -242,16 +235,31 @@ func (b *s3Backend) PutObject(
 	meta map[string]string,
 	input io.Reader, size int64,
 ) (result gofakes3.PutObjectResult, err error) {
-	return result, b.putStream(ctx, bucketName, objectName, meta, input, size)
+	_, err = b.putStream(ctx, bucketName, objectName, meta, input, size, "")
+	return result, err
 }
 
 // putStream stores the given object into the underlying storage. It is shared
 // by PutObject and the multipart-upload Complete step so both paths apply the
 // same directory creation, metadata and ignore rules.
+//
+// etag is the ETag to record for the object; when empty it is the MD5 of input.
+// It returns the recorded ETag.
 func (b *s3Backend) putStream(
 	ctx context.Context, bucketName, objectName string,
 	meta map[string]string,
 	input io.Reader, size int64,
+	etag string,
+) (string, error) {
+	err := b.putStreamInner(ctx, bucketName, objectName, meta, input, size, &etag)
+	return etag, err
+}
+
+func (b *s3Backend) putStreamInner(
+	ctx context.Context, bucketName, objectName string,
+	meta map[string]string,
+	input io.Reader, size int64,
+	etag *string,
 ) error {
 	bucket, err := getBucketByName(bucketName)
 	if err != nil {
@@ -317,6 +325,11 @@ func (b *s3Backend) putStream(
 	if setting.GetBool(conf.IgnoreSystemFiles) && utils.IsSystemFile(obj.Name) {
 		return errs.IgnoredSystemFile
 	}
+	var hasher hash.Hash
+	if *etag == "" {
+		hasher = md5.New()
+		input = io.TeeReader(input, hasher)
+	}
 	stream := &stream.FileStream{
 		Obj:      &obj,
 		Reader:   input,
@@ -331,7 +344,15 @@ func (b *s3Backend) putStream(
 		return err
 	}
 
-	b.meta.Store(fp, meta)
+	if hasher != nil {
+		// A driver that skips part of the body (e.g. an instant upload by hash) must not
+		// leave a truncated MD5 behind.
+		if _, err := io.Copy(io.Discard, input); err != nil {
+			return err
+		}
+		*etag = `"` + hex.EncodeToString(hasher.Sum(nil)) + `"`
+	}
+	saveObjectMeta(fp, size, *etag, meta)
 
 	return nil
 }
@@ -377,7 +398,11 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 		return err
 	}
 
-	return fs.Remove(ctx, fp)
+	if err := fs.Remove(ctx, fp); err != nil {
+		return err
+	}
+	deleteObjectMeta(fp)
+	return nil
 }
 
 // CreateBucket creates a new bucket.
@@ -406,20 +431,30 @@ func (b *s3Backend) BucketExists(ctx context.Context, name string) (exists bool,
 
 // CopyObject copy specified object from srcKey to dstKey.
 func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket, dstKey string, meta map[string]string) (result gofakes3.CopyObjectResult, err error) {
-	if srcBucket == dstBucket && srcKey == dstKey {
-		//TODO: update meta
-		return result, nil
-	}
+	replace := strings.EqualFold(meta["X-Amz-Metadata-Directive"], "REPLACE")
 
 	srcB, err := getBucketByName(srcBucket)
 	if err != nil {
 		return result, err
 	}
-	srcBucketPath := srcB.Path
-
-	srcFp := path.Join(srcBucketPath, srcKey)
+	srcFp := path.Join(srcB.Path, srcKey)
 	fmeta, _ := op.GetNearestMeta(srcFp)
 	srcNode, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), srcFp, &fs.GetArgs{})
+	if err != nil || srcNode.IsDir() {
+		return result, gofakes3.KeyNotFound(srcKey)
+	}
+	srcETag, srcMeta := loadObjectMeta(srcFp, srcNode)
+
+	if srcBucket == dstBucket && srcKey == dstKey {
+		// Copying an object onto itself is how S3 clients change its metadata.
+		if replace {
+			saveObjectMeta(srcFp, srcNode.GetSize(), srcETag, meta)
+		}
+		return gofakes3.CopyObjectResult{
+			ETag:         srcETag,
+			LastModified: gofakes3.NewContentTime(time.Now()),
+		}, nil
+	}
 
 	c, err := b.GetObject(ctx, srcBucket, srcKey, nil)
 	if err != nil {
@@ -429,22 +464,28 @@ func (b *s3Backend) CopyObject(ctx context.Context, srcBucket, srcKey, dstBucket
 		_ = c.Contents.Close()
 	}()
 
-	for k, v := range c.Metadata {
-		if _, found := meta[k]; !found && k != "X-Amz-Acl" {
-			meta[k] = v
+	putMeta := make(map[string]string)
+	if replace {
+		for k, v := range meta {
+			putMeta[k] = v
+		}
+	} else {
+		for k, v := range srcMeta {
+			putMeta[k] = v
 		}
 	}
-	if _, ok := meta["mtime"]; !ok {
-		meta["mtime"] = swift.TimeToFloatString(srcNode.ModTime())
+	_, hasMtime := putMeta["X-Amz-Meta-Mtime"]
+	if _, ok := putMeta["mtime"]; !ok && !hasMtime {
+		putMeta["mtime"] = swift.TimeToFloatString(srcNode.ModTime())
 	}
 
-	_, err = b.PutObject(ctx, dstBucket, dstKey, meta, c.Contents, c.Size)
+	etag, err := b.putStream(ctx, dstBucket, dstKey, putMeta, c.Contents, c.Size, "")
 	if err != nil {
 		return
 	}
 
 	return gofakes3.CopyObjectResult{
-		ETag:         `"` + hex.EncodeToString(c.Hash) + `"`,
-		LastModified: gofakes3.NewContentTime(srcNode.ModTime()),
+		ETag:         etag,
+		LastModified: gofakes3.NewContentTime(time.Now()),
 	}, nil
 }

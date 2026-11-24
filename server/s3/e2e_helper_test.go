@@ -89,3 +89,27 @@ func newE2ES3(t *testing.T, driverName string) *e2eS3 {
 	}
 	return &e2eS3{client: awss3.New(sess), bucket: bucket, mount: mount, localRoot: localRoot, url: srv.URL}
 }
+
+// newE2ES3OnStorage starts another server over the storage and bucket of s, as a restart
+// would: only the database and the files are shared.
+func newE2ES3OnStorage(t *testing.T, s *e2eS3) *e2eS3 {
+	t.Helper()
+	op.Cache.ClearAll()
+	h, err := NewServer(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := httptest.NewServer(h)
+	t.Cleanup(srv.Close)
+	sess, err := session.NewSession(&aws.Config{
+		Region:           aws.String("us-east-1"),
+		Endpoint:         aws.String(srv.URL),
+		S3ForcePathStyle: aws.Bool(true),
+		Credentials:      credentials.AnonymousCredentials,
+		MaxRetries:       aws.Int(0),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &e2eS3{client: awss3.New(sess), bucket: s.bucket, mount: s.mount, localRoot: s.localRoot, url: srv.URL}
+}
