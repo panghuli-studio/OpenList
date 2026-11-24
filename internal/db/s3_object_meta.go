@@ -57,3 +57,7 @@ func DeleteS3ObjectMetaTree(path string) error {
 	return errors.WithStack(db.Where("path_hash = ? OR path LIKE ? ESCAPE '\\'",
 		model.HashS3ObjectPath(path), escaped+"/%").Delete(&model.S3ObjectMeta{}).Error)
 }
+
+func DeleteS3ObjectMeta(path string) error {
+	return errors.WithStack(db.Where("path_hash = ?", model.HashS3ObjectPath(path)).Delete(&model.S3ObjectMeta{}).Error)
+}

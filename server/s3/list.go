@@ -85,7 +85,7 @@ func (b *s3Backend) listPage(
 	page gofakes3.ListBucketPage,
 ) (*gofakes3.ObjectList, error) {
 	result := newObjectPage(page)
-	_, err := b.walkPage(ctx, bucket, fdPath, name, addPrefix, result)
+	_, err := b.walkPage(ctx, bucket, fdPath, name, addPrefix, result, time.Time{})
 	if err != nil {
 		return nil, err
 	}
@@ -93,11 +93,13 @@ func (b *s3Backend) listPage(
 }
 
 // walkPage returns false after finding an entry beyond the requested page.
+// dirMod is the modification time of fdPath when the caller already has it.
 func (b *s3Backend) walkPage(
 	ctx context.Context,
 	bucket, fdPath, name string,
 	addPrefix bool,
 	page *objectPage,
+	dirMod time.Time,
 ) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err
@@ -112,20 +114,25 @@ func (b *s3Backend) walkPage(
 		return false, err
 	}
 
-	// workaround as s3 can't have empty files in directories, useful in deletions
+	// An empty directory is listed as a directory marker "dir/" (a zero-byte key ending in
+	// "/"), which is how S3 clients that create folders represent them. The bucket root
+	// itself is never a key.
 	if len(dirEntries) == 0 {
-		if !strings.HasPrefix(emptyObjectName, name) {
+		if fdPath == "" || name != "" {
 			return true, nil
 		}
+		if dirMod.IsZero() && b.statDir != nil {
+			if dir, err := b.statDir(ctx, fp); err == nil {
+				dirMod = dir.ModTime()
+			}
+		}
 		item := &gofakes3.Content{
-			// Key:          gofakes3.URLEncode(path.Join(fdPath, emptyObjectName)),
-			Key:          path.Join(fdPath, emptyObjectName),
-			LastModified: gofakes3.NewContentTime(time.Now()),
-			ETag:         getFileHash(nil), // No entry, so no hash
+			Key:          fdPath + "/",
+			LastModified: gofakes3.NewContentTime(dirMod),
+			ETag:         emptyETag,
 			Size:         0,
 			StorageClass: gofakes3.StorageStandard,
 		}
-		log.Debugf("Adding empty object %s to response", item.Key)
 		return page.addContent(item), nil
 	}
 
@@ -164,7 +171,7 @@ func (b *s3Backend) walkPage(
 			if subtreePrefix <= page.marker && !strings.HasPrefix(page.marker, subtreePrefix) {
 				continue
 			}
-			keepGoing, err := b.walkPage(ctx, bucket, objectPath, "", false, page)
+			keepGoing, err := b.walkPage(ctx, bucket, objectPath, "", false, page, entry.ModTime())
 			if err != nil || !keepGoing {
 				return keepGoing, err
 			}

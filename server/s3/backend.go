@@ -41,7 +41,11 @@ var (
 // assembled into storage on completion, instead of being buffered in memory.
 type s3Backend struct {
 	listDir func(context.Context, string) ([]model.Obj, error)
-	uploads *sync.Map // map[gofakes3.UploadID]*multipartState
+	// statDir returns a directory's own entry; only used for the mtime of an empty
+	// directory's marker. May be nil.
+	statDir  func(context.Context, string) (model.Obj, error)
+	dirLocks pathLocks
+	uploads  *sync.Map // map[gofakes3.UploadID]*multipartState
 }
 
 // newBackend creates a new SimpleBucketBackend.
@@ -49,6 +53,9 @@ func newBackend() gofakes3.Backend {
 	b := &s3Backend{
 		uploads: new(sync.Map),
 		listDir: getDirEntries,
+		statDir: func(ctx context.Context, p string) (model.Obj, error) {
+			return fs.Get(withMeta(ctx, p), p, &fs.GetArgs{})
+		},
 	}
 	b.startReaper()
 	return b
@@ -115,7 +122,11 @@ func (b *s3Backend) HeadObject(ctx context.Context, bucketName, objectName strin
 	}
 	bucketPath := bucket.Path
 
+	objectName = requestKey(ctx, objectName)
 	fp := path.Join(bucketPath, objectName)
+	if isMarkerKey(objectName) {
+		return markerObject(ctx, fp, objectName)
+	}
 	node, rec, err := b.statObject(ctx, fp)
 	if err != nil && rec == nil {
 		return nil, gofakes3.KeyNotFound(objectName)
@@ -163,7 +174,15 @@ func (b *s3Backend) GetObject(ctx context.Context, bucketName, objectName string
 	}
 	bucketPath := bucket.Path
 
+	objectName = requestKey(ctx, objectName)
 	fp := path.Join(bucketPath, objectName)
+	if isMarkerKey(objectName) {
+		obj, err := markerObject(ctx, fp, objectName)
+		if err == nil {
+			obj.Range, err = rangeRequest.Range(0)
+		}
+		return obj, err
+	}
 	node, rec, err := b.statObject(ctx, fp)
 	if err != nil {
 		if rec != nil {
@@ -303,6 +322,9 @@ func (b *s3Backend) putStreamInner(
 	fmeta, _ := op.GetNearestMeta(fp)
 	ctx = context.WithValue(ctx, conf.MetaKey, fmeta)
 
+	unlock := b.dirLocks.rlockAncestors(path.Clean(reqPath), path.Clean(bucketPath))
+	defer unlock()
+
 	_, err = fs.Get(ctx, reqPath, &fs.GetArgs{})
 	if err != nil {
 		if errs.IsObjectNotFound(err) && strings.Contains(objectName, "/") {
@@ -317,6 +339,12 @@ func (b *s3Backend) putStreamInner(
 	}
 
 	if isDir {
+		// A directory marker: the directory is the object; keep its metadata.
+		if size > 0 {
+			log.Warnf("s3: ignoring %d byte body of directory marker %s", size, objectName)
+		}
+		*etag = emptyETag
+		saveObjectMeta(fp+"/", 0, emptyETag, meta)
 		return nil
 	}
 
@@ -399,7 +427,7 @@ func (b *s3Backend) DeleteMulti(ctx context.Context, bucketName string, objects 
 
 // DeleteObject deletes the object with the given name.
 func (b *s3Backend) DeleteObject(ctx context.Context, bucketName, objectName string) (result gofakes3.ObjectDeleteResult, rerr error) {
-	return result, b.deleteObject(ctx, bucketName, objectName)
+	return result, b.deleteObject(ctx, bucketName, requestKey(ctx, objectName))
 }
 
 // deleteObject deletes the object from the filesystem.
@@ -411,11 +439,22 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 	bucketPath := bucket.Path
 
 	fp := path.Join(bucketPath, objectName)
-	fmeta, _ := op.GetNearestMeta(fp)
+	if path.Clean(fp) == path.Clean(bucketPath) {
+		return nil
+	}
+	if isMarkerKey(objectName) {
+		return b.deleteMarker(ctx, fp)
+	}
 	// S3 does not report an error when attemping to delete a key that does not exist, so
 	// we need to skip IsNotExist errors.
-	if _, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{}); err != nil && !errs.IsObjectNotFound(err) {
+	node, err := fs.Get(withMeta(ctx, fp), fp, &fs.GetArgs{})
+	if err != nil && !errs.IsObjectNotFound(err) {
 		return err
+	}
+	if err == nil && node.IsDir() {
+		// "dir" without the slash is not an S3 key; removing the directory here would
+		// delete every object below it.
+		return nil
 	}
 
 	if err := fs.Remove(ctx, fp); err != nil {
