@@ -1,0 +1,103 @@
+# Builds our OpenList image from `dev` and publishes it to ghcr.io/panghuli-studio/openlist
+# as <upstream tag>-panghuli.N, plus a git tag and GitHub release of the same name.
+# Deployments pin the image by digest, so the release notes carry the digest.
+name: panghuli release
+
+on:
+  push:
+    branches: [dev]
+    paths-ignore:
+      - "**.md"
+      - ".github/ISSUE_TEMPLATE/**"
+      - ".github/workflows/panghuli-upstream-watch.yml"
+      - ".github/workflows/panghuli-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  packages: write
+
+concurrency:
+  group: panghuli-release
+  cancel-in-progress: false
+
+env:
+  IMAGE: ghcr.io/${{ github.repository_owner }}/openlist
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Go test
+        run: go test -count=1 ./server/s3/... ./internal/op/... ./internal/db/... ./drivers/115_open/... ./drivers/local/...
+
+  release:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - id: prep
+        run: bash .github/panghuli/prepare.sh
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: .github/panghuli/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          build-args: |
+            VERSION=${{ steps.prep.outputs.tag }}
+            WEB_VERSION=${{ steps.prep.outputs.web_version }}
+            GIT_COMMIT=${{ steps.prep.outputs.commit }}
+            BUILT_AT=${{ steps.prep.outputs.built_at }}
+          tags: ${{ env.IMAGE }}:${{ steps.prep.outputs.tag }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.tag }}
+            org.opencontainers.image.licenses=AGPL-3.0-only
+          cache-from: type=gha,scope=panghuli
+          cache-to: type=gha,scope=panghuli,mode=max
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.prep.outputs.tag }}
+          PREVIOUS: ${{ steps.prep.outputs.previous }}
+          WEB_VERSION: ${{ steps.prep.outputs.web_version }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          {
+            echo "Built from \`dev\` at ${GITHUB_SHA}."
+            echo
+            echo "Image: \`${IMAGE}:${TAG}\`"
+            echo
+            echo "Digest: \`${IMAGE}@${DIGEST}\`"
+            echo
+            echo "Platforms: linux/amd64, linux/arm64. Front-end: OpenList-Frontend ${WEB_VERSION}."
+            echo
+            if [ -n "$PREVIOUS" ]; then
+              echo "Changes since ${PREVIOUS}:"
+              range="${PREVIOUS}..${GITHUB_SHA}"
+            else
+              base=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-panghuli.*' HEAD)
+              echo "Changes on top of upstream ${base}:"
+              range="${base}..${GITHUB_SHA}"
+            fi
+            echo
+            git log --no-merges --format='- %s (%h)' "$range" | head -100
+          } > notes.md
+          gh release create "$TAG" --target "$GITHUB_SHA" --title "$TAG" --notes-file notes.md
