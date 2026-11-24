@@ -21,9 +21,9 @@ var config = driver.Config{
 	Name:          "115 Open",
 	DefaultRoot:   "0",
 	LinkCacheMode: driver.LinkCacheUA,
-	// The upload API has no overwrite option, so uploading over an existing name does not
-	// replace the file. op.Put renames the old file away and deletes it after the upload.
-	NoOverwriteUpload: true,
+	// Not NoOverwriteUpload: op.Put would rename the old file to "<name>.openlist_to_delete" and
+	// later delete it by that name, but 115 keeps the old extension on rename ("a.txt" becomes
+	// "a.txt.txt"), so the delete misses and the old file is left behind. Put replaces it itself.
 }
 
 func init() {
