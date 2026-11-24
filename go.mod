@@ -337,3 +337,8 @@ replace github.com/cronokirby/saferith => github.com/Da3zKi7/saferith v0.33.0-fi
 // replace github.com/OpenListTeam/115-sdk-go => ../../OpenListTeam/115-sdk-go
 
 replace github.com/KarpelesLab/reflink => github.com/OpenListTeam/reflink v0.0.0-20260701021214-78760eaeafef
+
+// panghuli-studio fork of gofakes3 with S3 compatibility fixes. When upstream bumps
+// gofakes3, rebase the fork onto that version and tag it; otherwise this replace silently
+// keeps the old version.
+replace github.com/OpenListTeam/gofakes3 => github.com/panghuli-studio/gofakes3 v0.8.2-panghuli.1
