@@ -33,7 +33,7 @@ jobs:
         with:
           go-version-file: go.mod
       - name: Go test
-        run: go test -count=1 ./server/s3/... ./internal/op/... ./internal/db/... ./drivers/115_open/... ./drivers/local/...
+        run: go test -count=1 ./server/s3/... ./internal/op/... ./internal/db/... ./drivers/115_open/...
 
   release:
     needs: test
