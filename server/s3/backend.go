@@ -377,8 +377,7 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 		return err
 	}
 
-	fs.Remove(ctx, fp)
-	return nil
+	return fs.Remove(ctx, fp)
 }
 
 // CreateBucket creates a new bucket.
