@@ -21,6 +21,9 @@ var config = driver.Config{
 	Name:          "115 Open",
 	DefaultRoot:   "0",
 	LinkCacheMode: driver.LinkCacheUA,
+	// The upload API has no overwrite option, so uploading over an existing name does not
+	// replace the file. op.Put renames the old file away and deletes it after the upload.
+	NoOverwriteUpload: true,
 }
 
 func init() {
