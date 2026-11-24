@@ -372,7 +372,61 @@ func (d *Open115) Remove(ctx context.Context, obj model.Obj) error {
 	return nil
 }
 
+// Put replaces an existing file of the same name: the 115 upload API has no overwrite option.
+// The old file is renamed aside first, then deleted by ID once the upload succeeds, or renamed
+// back if it fails. It is never looked up by its temporary name, because 115 rewrites the
+// extension of a renamed file to the old one ("a.txt" -> "a.tmp" gives "a.txt").
 func (d *Open115) Put(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
+	exist := file.GetExist()
+	if exist == nil || exist.IsDir() {
+		return d.upload(ctx, dstDir, file, up)
+	}
+	old := unwrapObj(exist)
+	if old == nil {
+		return fmt.Errorf("cannot replace existing %s: unexpected object type %T", exist.GetName(), exist)
+	}
+	if err := d.renameByID(ctx, old.GetID(), asideName(old)); err != nil {
+		return fmt.Errorf("move existing file aside before overwrite: %w", err)
+	}
+	if err := d.upload(ctx, dstDir, file, up); err != nil {
+		if rerr := d.renameByID(context.WithoutCancel(ctx), old.GetID(), old.GetName()); rerr != nil {
+			return fmt.Errorf("%w (and restoring the original file %s failed: %v)", err, old.GetName(), rerr)
+		}
+		return err
+	}
+	return d.Remove(ctx, old)
+}
+
+func unwrapObj(obj model.Obj) *Obj {
+	for {
+		switch o := obj.(type) {
+		case *Obj:
+			return o
+		case model.ObjUnwrap:
+			obj = o.Unwrap()
+		default:
+			return nil
+		}
+	}
+}
+
+// asideName keeps the old extension so 115 stores the name as given.
+func asideName(old *Obj) string {
+	name := old.GetName()
+	ext := stdpath.Ext(name)
+	return strings.TrimSuffix(name, ext) + ".openlist_to_delete_" + old.GetID() + ext
+}
+
+// renameByID does not go through Rename, which updates the cached object's name in place.
+func (d *Open115) renameByID(ctx context.Context, fileID, name string) error {
+	if err := d.WaitLimit(ctx); err != nil {
+		return err
+	}
+	_, err := d.client.UpdateFile(ctx, &sdk.UpdateFileReq{FileID: fileID, FileName: name})
+	return err
+}
+
+func (d *Open115) upload(ctx context.Context, dstDir model.Obj, file model.FileStreamer, up driver.UpdateProgress) error {
 	err := d.WaitLimit(ctx)
 	if err != nil {
 		return err
