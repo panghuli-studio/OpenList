@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http/httptest"
 	"testing"
 
@@ -17,6 +18,8 @@ import (
 	awss3 "github.com/aws/aws-sdk-go/service/s3"
 	"gorm.io/gorm"
 )
+
+var e2eMounts int
 
 // e2eS3 is a real S3 server (NewServer) over one storage, driven by the AWS SDK.
 type e2eS3 struct {
@@ -39,7 +42,8 @@ func newE2ES3(t *testing.T, driverName string) *e2eS3 {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mount := "/" + sanitizeTestName(t.Name())
+	e2eMounts++
+	mount := fmt.Sprintf("/%s-%d", sanitizeTestName(t.Name()), e2eMounts)
 	storageID, err := op.CreateStorage(ctx, model.Storage{
 		Driver:    driverName,
 		MountPath: mount,

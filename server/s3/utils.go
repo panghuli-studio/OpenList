@@ -29,7 +29,8 @@ func mapBackendError(err error) error {
 	return err
 }
 
-const emptyObjectName = "ThisIsAnEmptyFolderInTheS3Bucket"
+// emptyETag is the ETag of zero bytes, used for directory markers.
+const emptyETag = `"d41d8cd98f00b204e9800998ecf8427e"`
 
 func getAndParseBuckets() ([]Bucket, error) {
 	var res []Bucket

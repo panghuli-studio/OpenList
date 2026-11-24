@@ -45,7 +45,8 @@ func directObjectURL(r *http.Request, authPairs map[string]string) (string, bool
 		return "", false
 	}
 	bucketName, objectName, ok := parseObjectPath(r.URL.Path)
-	if !ok {
+	// "dir/" is a directory marker; path.Join below would resolve it to a file "dir".
+	if !ok || strings.HasSuffix(objectName, "/") {
 		return "", false
 	}
 	bucket, err := getBucketByName(bucketName)
