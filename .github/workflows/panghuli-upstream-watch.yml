@@ -1,0 +1,125 @@
+# Daily sync with upstream OpenListTeam/OpenList.
+# Branch rule: `main` only mirrors upstream; `dev` is protected, is what releases are built
+# from, and takes upstream changes through a PR. So this job
+#   1. fast-forwards our `main` to upstream `main` and copies upstream release tags (the
+#      release tag is derived from the nearest upstream tag, so dev needs them), then
+#   2. opens or refreshes one issue describing what upstream has that dev lacks.
+# Upstream workflows are disabled by id in the repo settings; a workflow file upstream adds
+# later starts out enabled, so the issue lists new ones to disable.
+name: panghuli upstream watch
+
+on:
+  schedule:
+    - cron: "23 1 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: read
+
+env:
+  UPSTREAM_REPO: OpenListTeam/OpenList
+  LABEL: upstream-update
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dev
+          fetch-depth: 0
+      - name: Sync main and compare with dev
+        env:
+          GH_TOKEN: ${{ github.token }}
+          # Without this, gh picks the `upstream` remote added below and acts on upstream.
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --quiet --no-tags upstream "+refs/heads/main:refs/remotes/upstream/main"
+          git fetch --quiet --no-tags upstream "+refs/tags/v*:refs/tags/upstream/v*"
+          git fetch --quiet origin "+refs/heads/main:refs/remotes/origin/main"
+          gh label create "$LABEL" --color 0E8A16 --description "Upstream has changes not in dev" --force >/dev/null
+
+          # Fast-forward only: if our main ever diverges, stop and let a human look.
+          if ! git merge-base --is-ancestor origin/main upstream/main; then
+            echo "::error::origin/main has commits upstream/main lacks; not syncing"
+            exit 1
+          fi
+          if [ "$(git rev-parse origin/main)" != "$(git rev-parse upstream/main)" ]; then
+            git push origin "refs/remotes/upstream/main:refs/heads/main"
+          fi
+
+          # Copy upstream release tags we do not have yet (never overwrite an existing tag).
+          for ref in $(git for-each-ref --format='%(refname:strip=3)' refs/tags/upstream/); do
+            case "$ref" in *-panghuli.*) continue ;; esac
+            if ! git rev-parse -q --verify "refs/tags/${ref}" >/dev/null; then
+              git push --quiet origin "refs/tags/upstream/${ref}:refs/tags/${ref}"
+            fi
+          done
+
+          up=upstream/main
+          head=$(git rev-parse "$up")
+          count=$(git rev-list --count "HEAD..${up}")
+          latest=$(gh release view -R "$UPSTREAM_REPO" --json tagName --jq .tagName)
+          ours=$(git describe --tags --abbrev=0 --match 'v[0-9]*' --exclude '*-panghuli.*' HEAD)
+          if [ "$count" -eq 0 ]; then
+            echo "dev already contains ${up} (${head})"
+            exit 0
+          fi
+
+          base=$(git merge-base HEAD "$up")
+          git -c user.name=ci -c user.email=ci@localhost merge --no-commit --no-ff "$up" >/dev/null 2>&1 || true
+          conflicts=$(git diff --name-only --diff-filter=U)
+          git merge --abort >/dev/null 2>&1 || git reset --hard --quiet HEAD
+
+          known=$(gh api "repos/${GITHUB_REPOSITORY}/actions/workflows" --paginate --jq '.workflows[].path')
+          new_workflows=$(git ls-tree --name-only "${up}" .github/workflows/ | grep -v '/panghuli-' | grep -vxF "$known" || true)
+
+          {
+            echo "上游 \`${UPSTREAM_REPO}@main\` 有 **${count}** 个提交还没进 \`dev\`。"
+            echo "上游最新 release：**${latest}**；\`dev\` 当前基于 **${ours}**。"
+            echo
+            echo "从 \`dev\` 切分支合并上游 release tag（或 \`main\`），开 PR 到 \`dev\`；合并后发布 \`<上游版本>-panghuli.N\`。"
+            echo
+            echo "- 上游最新：[\`${head:0:9}\`](https://github.com/${UPSTREAM_REPO}/commit/${head})"
+            echo "- 完整对比：https://github.com/${UPSTREAM_REPO}/compare/${base}...${head}"
+            echo "- 改动规模：$(git diff --shortstat "${base}..${up}")"
+            echo "- 涉及 S3 / 115 Open（我们打过补丁的目录）："
+            git diff --stat "${base}..${up}" -- server/s3 drivers/115_open internal/op | tail -1 | sed 's/^/  /'
+            echo
+            echo "## 合并预检"
+            echo
+            if [ -n "$conflicts" ]; then
+              echo "试合并 \`main\` **有冲突**："
+              echo
+              sed 's/^/- `/; s/$/`/' <<<"$conflicts"
+            else
+              echo "试合并 \`main\` 无冲突。"
+            fi
+            if [ -n "$new_workflows" ]; then
+              echo
+              echo "上游新增了工作流文件，合入 \`dev\` 前先在 Actions 设置里禁用："
+              echo
+              sed 's/^/- `/; s/$/`/' <<<"$new_workflows"
+            fi
+            echo
+            echo "## 上游新提交"
+            echo
+            git log --no-merges --date=short \
+              --format="- [\`%h\`](https://github.com/${UPSTREAM_REPO}/commit/%H) %s（%an，%ad）" \
+              "HEAD..${up}" | head -150
+            if [ "$count" -gt 150 ]; then echo; echo "（只列前 150 个，其余见完整对比）"; fi
+            echo
+            echo "<!-- upstream-head: ${head} -->"
+          } > body.md
+
+          title="上游更新：${latest}（main 领先 dev ${count} 个提交，${head:0:9}）"
+          issue=$(gh issue list --state open --label "$LABEL" --json number --jq '.[0].number // empty')
+          if [ -z "$issue" ]; then
+            gh issue create --label "$LABEL" --title "$title" --body-file body.md
+          elif ! gh issue view "$issue" --json body --jq .body | grep -q "upstream-head: ${head}"; then
+            gh issue edit "$issue" --title "$title" --body-file body.md
+          fi
