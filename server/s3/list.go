@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/db"
 	"github.com/OpenListTeam/OpenList/v4/internal/model"
 	"github.com/OpenListTeam/gofakes3"
 	log "github.com/sirupsen/logrus"
@@ -137,6 +138,7 @@ func (b *s3Backend) walkPage(
 		return listSortKey(dirEntries[i]) < listSortKey(dirEntries[j])
 	})
 
+	records := b.loadDirRecords(fp, dirEntries)
 	for _, entry := range dirEntries {
 		object := entry.GetName()
 
@@ -171,10 +173,10 @@ func (b *s3Backend) walkPage(
 				// Key:          gofakes3.URLEncode(objectPath),
 				Key:          objectPath,
 				LastModified: gofakes3.NewContentTime(entry.ModTime()),
-				ETag:         getFileHash(entry),
 				Size:         entry.GetSize(),
 				StorageClass: gofakes3.StorageStandard,
 			}
+			item.ETag, _ = etagAndMeta(records[path.Join(fp, object)], entry)
 			if !page.addContent(item) {
 				return false, nil
 			}
@@ -190,4 +192,23 @@ func listSortKey(entry model.Obj) string {
 		return entry.GetName() + "/"
 	}
 	return entry.GetName()
+}
+
+// loadDirRecords fetches the stored S3 records of the files in one directory listing.
+func (b *s3Backend) loadDirRecords(dir string, entries []model.Obj) map[string]*model.S3ObjectMeta {
+	paths := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			paths = append(paths, path.Join(dir, e.GetName()))
+		}
+	}
+	if len(paths) == 0 {
+		return nil
+	}
+	records, err := db.GetS3ObjectMetas(paths)
+	if err != nil {
+		log.Errorf("s3: load metadata under %s: %+v", dir, err)
+		return nil
+	}
+	return records
 }
