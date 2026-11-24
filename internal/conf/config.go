@@ -87,6 +87,10 @@ type S3 struct {
 	Port         int    `json:"port" env:"PORT"`
 	SSL          bool   `json:"ssl" env:"SSL"`
 	MultipartTTL string `json:"multipart_ttl" env:"MULTIPART_TTL"`
+	// DisableRedirect makes the S3 server always proxy object data instead of answering
+	// GET with 302 to the storage's download URL and PUT with 307 to its upload URL.
+	// Clients such as pgBackRest do not follow redirects.
+	DisableRedirect bool `json:"disable_redirect" env:"DISABLE_REDIRECT"`
 }
 
 type FTP struct {
