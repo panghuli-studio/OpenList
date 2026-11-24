@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"net/http"
 
+	"github.com/OpenListTeam/OpenList/v4/internal/conf"
 	"github.com/OpenListTeam/gofakes3"
 )
 
@@ -24,5 +25,9 @@ func NewServer(ctx context.Context) (h http.Handler, err error) {
 		gofakes3.WithIntegrityCheck(true), // Check Content-MD5 if supplied
 	)
 
-	return trailingSlashHandler(redirectHandler(rangeStatusHandler(faker.Server()), authPairs)), nil
+	h = rangeStatusHandler(faker.Server())
+	if conf.Conf == nil || !conf.Conf.S3.DisableRedirect {
+		h = redirectHandler(h, authPairs)
+	}
+	return trailingSlashHandler(h), nil
 }
