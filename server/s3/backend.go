@@ -373,8 +373,13 @@ func (b *s3Backend) deleteObject(ctx context.Context, bucketName, objectName str
 	fmeta, _ := op.GetNearestMeta(fp)
 	// S3 does not report an error when attemping to delete a key that does not exist, so
 	// we need to skip IsNotExist errors.
-	if _, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{}); err != nil && !errs.IsObjectNotFound(err) {
+	obj, err := fs.Get(context.WithValue(ctx, conf.MetaKey, fmeta), fp, &fs.GetArgs{})
+	if err != nil && !errs.IsObjectNotFound(err) {
 		return err
+	}
+	// A directory is not an object. Removing it here would delete everything below it.
+	if obj != nil && obj.IsDir() {
+		return nil
 	}
 
 	fs.Remove(ctx, fp)
